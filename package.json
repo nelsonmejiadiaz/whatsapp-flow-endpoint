@@ -1,0 +1,32 @@
+{
+  "name": "whatsapp-flow-endpoint",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
+  }
+}
+EOFcat > package.json << 'EOF'
+{
+  "name": "whatsapp-flow-endpoint",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
+  }
+}
+EOFcat > package.json << 'EOF'
+{
+  "name": "whatsapp-flow-endpoint",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
+  }
+}
