@@ -1,78 +1,146 @@
-import express from "express";
-import crypto from "crypto";
-import fetch from "node-fetch";
+const express = require('express');
+const http = require('http');
+const { WebSocketServer } = require('ws');
+const path = require('path');
 
 const app = express();
-app.use(express.json());
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const GOOGLE_SHEET_URL = process.env.GOOGLE_SHEET_URL;
+app.use(express.static(path.join(__dirname, '../public')));
 
-app.post("/", async (req, res) => {
-  const body = req.body;
-  if (body?.action === "ping") {
-    return res.json({ data: { status: "active" } });
-  }
-  try {
-    const { decryptedBody, aesKey, iv } = decryptRequest(body, PRIVATE_KEY);
-    const { action, screen } = decryptedBody;
-    let responseData;
-    if (action === "INIT") {
-      const agencias = await obtenerAgencias();
-      responseData = { screen: "FORMULARIO", data: { agencias } };
-    } else if (action === "data_exchange" && screen === "FORMULARIO") {
-      const { agencia_valor, fecha_inicio_valor, fecha_fin_valor } = decryptedBody.data;
-      responseData = { screen: "CONFIRMACION", data: { agencia_valor, fecha_inicio_valor, fecha_fin_valor } };
+const agents = new Map();
+const clients = new Map();
+const queue   = [];
+
+let clientCounter = 0;
+let agentCounter  = 0;
+
+function send(ws, msg) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
+}
+
+function broadcastAgents(msg) {
+  agents.forEach(ws => send(ws, msg));
+}
+
+function queueSnapshot() {
+  return queue.map(q => ({
+    clientId: q.clientId,
+    waitSecs: Math.floor((Date.now() - q.joinedAt) / 1000),
+  }));
+}
+
+wss.on('connection', (ws) => {
+  let myId   = null;
+  let myRole = null;
+
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    if (msg.type === 'register') {
+      myRole = msg.role;
+
+      if (myRole === 'agent') {
+        myId = `agent-${++agentCounter}`;
+        agents.set(myId, ws);
+        send(ws, { type: 'registered', id: myId, queue: queueSnapshot() });
+        console.log(`[+] Agente conectado: ${myId}`);
+      }
+
+      if (myRole === 'client') {
+        myId = `client-${++clientCounter}`;
+        clients.set(myId, { ws, agentId: null, state: 'queued' });
+        queue.push({ clientId: myId, joinedAt: Date.now() });
+        send(ws, { type: 'registered', id: myId });
+        send(ws, { type: 'queued', position: queue.length });
+        broadcastAgents({ type: 'queue_update', queue: queueSnapshot() });
+        console.log(`[+] Cliente en cola: ${myId}`);
+      }
     }
-    const encrypted = encryptResponse(responseData, aesKey, iv);
-    res.set("Content-Type", "text/plain");
-    res.send(encrypted);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Error");
-  }
+
+    if (msg.type === 'accept' && myRole === 'agent') {
+      const clientId = msg.clientId;
+      const client   = clients.get(clientId);
+      if (!client) return;
+
+      const idx = queue.findIndex(q => q.clientId === clientId);
+      if (idx !== -1) queue.splice(idx, 1);
+
+      client.agentId = myId;
+      client.state   = 'connecting';
+
+      send(client.ws, { type: 'accepted', agentId: myId });
+      send(ws, { type: 'call_started', clientId });
+      broadcastAgents({ type: 'queue_update', queue: queueSnapshot() });
+      console.log(`[↔] ${myId} aceptó a ${clientId}`);
+    }
+
+    if (msg.type === 'reject' && myRole === 'agent') {
+      const clientId = msg.clientId;
+      const client   = clients.get(clientId);
+      if (!client) return;
+
+      const idx = queue.findIndex(q => q.clientId === clientId);
+      if (idx !== -1) queue.splice(idx, 1);
+
+      send(client.ws, { type: 'rejected' });
+      clients.delete(clientId);
+      broadcastAgents({ type: 'queue_update', queue: queueSnapshot() });
+    }
+
+    if (['offer', 'answer', 'ice'].includes(msg.type)) {
+      if (myRole === 'client') {
+        const client  = clients.get(myId);
+        const agentWs = client?.agentId ? agents.get(client.agentId) : null;
+        if (agentWs) send(agentWs, { ...msg, from: myId });
+      }
+      if (myRole === 'agent') {
+        const clientData = clients.get(msg.to);
+        if (clientData) send(clientData.ws, { ...msg, from: myId });
+      }
+    }
+
+    if (msg.type === 'hangup') {
+      if (myRole === 'client') {
+        const client  = clients.get(myId);
+        const agentWs = client?.agentId ? agents.get(client.agentId) : null;
+        if (agentWs) send(agentWs, { type: 'hangup', clientId: myId });
+        clients.delete(myId);
+        const idx = queue.findIndex(q => q.clientId === myId);
+        if (idx !== -1) queue.splice(idx, 1);
+        broadcastAgents({ type: 'queue_update', queue: queueSnapshot() });
+      }
+      if (myRole === 'agent') {
+        const clientData = clients.get(msg.clientId);
+        if (clientData) {
+          send(clientData.ws, { type: 'hangup' });
+          clients.delete(msg.clientId);
+        }
+        broadcastAgents({ type: 'queue_update', queue: queueSnapshot() });
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    if (myRole === 'agent') {
+      agents.delete(myId);
+      console.log(`[-] Agente desconectado: ${myId}`);
+    }
+    if (myRole === 'client') {
+      const client = clients.get(myId);
+      if (client?.agentId) {
+        const agentWs = agents.get(client.agentId);
+        if (agentWs) send(agentWs, { type: 'hangup', clientId: myId });
+      }
+      clients.delete(myId);
+      const idx = queue.findIndex(q => q.clientId === myId);
+      if (idx !== -1) queue.splice(idx, 1);
+      broadcastAgents({ type: 'queue_update', queue: queueSnapshot() });
+    }
+  });
 });
 
-async function obtenerAgencias() {
-  try {
-    const response = await fetch(GOOGLE_SHEET_URL, { method: "POST" });
-    const json = await response.json();
-    return json.data.agencias;
-  } catch (e) {
-    return [
-      { id: "0_Nelson", title: "Agencia Nelson" },
-      { id: "1_Mabel", title: "Agencia Mabel" },
-      { id: "2_Joan", title: "Agencia Joan" },
-      { id: "3_Adriana", title: "Agencia Adriana" },
-      { id: "4_Gluky", title: "Agencia Gluky" }
-    ];
-  }
-}
-
-function decryptRequest(body, privatePem) {
-  const { encrypted_aes_key, encrypted_flow_data, initial_vector } = body;
-  const aesKey = crypto.privateDecrypt(
-    { key: crypto.createPrivateKey(privatePem), padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: "sha256" },
-    Buffer.from(encrypted_aes_key, "base64")
-  );
-  const flowData = Buffer.from(encrypted_flow_data, "base64");
-  const iv = Buffer.from(initial_vector, "base64");
-  const tag = flowData.subarray(-16);
-  const encBody = flowData.subarray(0, -16);
-  const decipher = crypto.createDecipheriv("aes-128-gcm", aesKey, iv);
-  decipher.setAuthTag(tag);
-  const decrypted = Buffer.concat([decipher.update(encBody), decipher.final()]);
-  return { decryptedBody: JSON.parse(decrypted.toString("utf-8")), aesKey, iv };
-}
-
-function encryptResponse(response, aesKey, iv) {
-  const flippedIv = Buffer.from(iv.map(b => ~b));
-  const cipher = crypto.createCipheriv("aes-128-gcm", aesKey, flippedIv);
-  return Buffer.concat([
-    cipher.update(JSON.stringify(response), "utf-8"),
-    cipher.final(),
-    cipher.getAuthTag()
-  ]).toString("base64");
-}
-
-app.listen(3000, () => console.log("Servidor activo en puerto 3000"));
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`✅ Servidor en http://localhost:${PORT}`));
